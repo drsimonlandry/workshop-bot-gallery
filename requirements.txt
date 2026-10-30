@@ -1,0 +1,6 @@
+streamlit>=1.40,<2
+langgraph-sdk>=0.2,<1
+supabase>=2.10,<3
+cryptography>=43
+httpx>=0.27
+pytest>=8
