@@ -74,6 +74,14 @@ def test_register_encrypts_and_hashes():
     assert token not in row["manage_token_hash"] and sec.verify_token(token, row["manage_token_hash"])
 
 
+def test_minimal_registration_needs_only_name_and_connection():
+    repo = FakeRepo()
+    bot, _ = reg.register_bot(repo, KEY, name="Bot", agent_id=AGENT, api_url=URL, pat=PAT, acknowledged=True)
+    assert repo.rows[bot["id"]]["creator_name"] == "" and repo.rows[bot["id"]]["description"] == ""
+    with pytest.raises(reg.ValidationError):
+        reg.register_bot(repo, KEY, name=" ", agent_id=AGENT, api_url=URL, pat=PAT, acknowledged=True)
+
+
 def test_public_listing_never_exposes_credentials():
     repo = FakeRepo()
     register(repo)
@@ -170,3 +178,44 @@ def test_auth_failure_marks_bot_unavailable(monkeypatch):
     with pytest.raises(fleet_client.FleetError):
         reg.chat_with_bot(repo, KEY, sec.UsageLimiter(), "v", bot["id"], None, "hi")
     assert repo.rows[bot["id"]]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("prev,new,expected", [
+    (None, 1, (1, 0)), (None, 0, (0, 1)), (1, 0, (-1, 1)), (0, 1, (1, -1)),
+    (1, None, (-1, 0)), (0, None, (0, -1)), (1, 1, (0, 0)), (None, None, (0, 0)),
+])
+def test_feedback_delta(prev, new, expected):
+    assert reg.feedback_delta(prev, new) == expected
+
+
+def test_repository_orders_least_popular_first_and_bumps_atomically():
+    from database import BotRepository
+
+    calls = []
+
+    class Q:
+        def __getattr__(self, name):
+            def f(*a, **k):
+                calls.append((name, a, k))
+                return self
+            return f
+
+        def execute(self):
+            class R:
+                data = []
+            return R()
+
+    class C:
+        def table(self, name):
+            return Q()
+
+        def rpc(self, fn, params):
+            calls.append(("rpc", fn, params))
+            return Q()
+
+    repo = BotRepository(C())
+    repo.list_public_bots()
+    order = [c for c in calls if c[0] == "order"]
+    assert order[0][1] == ("chat_count",) and order[1][1] == ("created_at",)
+    repo.bump("b1", chats=1)
+    assert ("rpc", "bump_bot", {"p_bot": "b1", "p_chats": 1, "p_up": 0, "p_down": 0}) in calls

@@ -21,9 +21,10 @@ TRANSIENT_RETRIES = 1
 class FleetError(Exception):
     """Carries a user-safe message; never includes credentials or raw API bodies."""
 
-    def __init__(self, message: str, kind: str = "unknown"):
+    def __init__(self, message: str, kind: str = "unknown", detail: str = ""):
         super().__init__(message)
         self.kind = kind
+        self.detail = detail  # structure only, never content; shown when DEBUG is on
 
 
 def _make_client(api_url: str, pat: str, timeout: float):
@@ -87,6 +88,20 @@ async def _with_retry(factory):
             raise err from None
 
 
+def _describe(result) -> str:
+    """Shape of a response (keys, message types, content kinds) without any content."""
+    if not isinstance(result, dict):
+        return f"result={type(result).__name__}"
+    msgs = result.get("messages")
+    parts = []
+    for m in msgs if isinstance(msgs, list) else []:
+        if isinstance(m, dict):
+            c = m.get("content")
+            kinds = [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in c] if isinstance(c, list) else type(c).__name__
+            parts.append(f"{m.get('type') or m.get('role')}:{kinds}")
+    return f"keys={sorted(result)} messages={parts}"
+
+
 def extract_text(result) -> str:
     """Return the final user-visible assistant text from a runs.wait() result.
 
@@ -94,17 +109,19 @@ def extract_text(result) -> str:
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
-        raise FleetError("The agent returned an unexpected response. Try again.", "bad_response")
+        raise FleetError("The agent returned an unexpected response. Try again.", "bad_response", _describe(result))
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
-        role = message.get("type") or message.get("role")
-        if role not in ("ai", "assistant"):
+        role = str(message.get("type") or message.get("role") or "").lower()
+        if role not in ("ai", "assistant", "aimessage", "aimessagechunk"):
             continue
         text = _content_to_text(message.get("content"))
         if text:
             return text
-    raise FleetError("The agent didn't send a reply. Try again.", "bad_response")
+    if isinstance(result, dict) and result.get("__interrupt__"):
+        raise FleetError("This agent is waiting for an approval and can't answer in the gallery.", "bad_response", _describe(result))
+    raise FleetError("The agent didn't send a reply. Try again.", "bad_response", _describe(result))
 
 
 def _content_to_text(content) -> str:

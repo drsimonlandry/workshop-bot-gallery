@@ -16,8 +16,8 @@ class ValidationError(Exception):
 
 def clean_fields(name: str, creator_name: str, description: str) -> tuple[str, str, str]:
     name, creator_name, description = (s.strip() for s in (name, creator_name, description))
-    if not (name and creator_name and description):
-        raise ValidationError("Fill in the bot name, your name, and a description.")
+    if not name:
+        raise ValidationError("Enter a bot name.")
     if len(name) > MAX_NAME or len(creator_name) > MAX_NAME:
         raise ValidationError(f"Names can be up to {MAX_NAME} characters.")
     if len(description) > MAX_DESCRIPTION:
@@ -45,8 +45,8 @@ def test_connection(agent_id: str, api_url: str, pat: str) -> None:
 test_connection.__test__ = False  # not a pytest test
 
 
-def register_bot(repo: BotRepository, encryption_key: str, *, name, creator_name, description,
-                 agent_id, api_url, pat, acknowledged: bool) -> tuple[dict, str]:
+def register_bot(repo: BotRepository, encryption_key: str, *, name, agent_id, api_url, pat, acknowledged: bool,
+                 creator_name="", description="") -> tuple[dict, str]:
     """Validate, verify against Fleet, encrypt, and save. Returns (bot, management_token)."""
     if not acknowledged:
         raise ValidationError("Confirm that you understand visitors will use your agent with your authorization.")
@@ -82,10 +82,10 @@ def replace_credential(repo: BotRepository, encryption_key: str, bot_id: str, to
     repo.replace_pat(bot_id, security.encrypt_secret(pat, encryption_key))
 
 
-def update_details(repo: BotRepository, bot_id: str, token: str, name: str, description: str) -> None:
+def update_details(repo: BotRepository, bot_id: str, token: str, name: str, description: str = "") -> None:
     if not authorize_owner(repo, bot_id, token):
         raise security.SecurityError("That management link isn't valid.")
-    name, _, description = clean_fields(name, "x", description)
+    name, _, description = clean_fields(name, "", description)
     repo.update_details(bot_id, name, description)
 
 
@@ -115,3 +115,13 @@ def chat_with_bot(repo: BotRepository, encryption_key: str, limiter: security.Us
                 repo.set_status(bot_id, "unavailable")  # owner must replace their token
             raise
     return thread_id, reply
+
+
+def feedback_delta(prev, new) -> tuple[int, int]:
+    """Counter changes (up, down) when a message's vote moves from prev to new.
+
+    Votes: 1 = thumbs up, 0 = thumbs down, None = no vote.
+    """
+    up = (new == 1) - (prev == 1)
+    down = (new == 0 and new is not None) - (prev == 0 and prev is not None)
+    return up, down

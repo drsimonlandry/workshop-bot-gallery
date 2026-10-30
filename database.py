@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 log = logging.getLogger(__name__)
 
 # Columns safe to return to visitors. Never includes encrypted_pat or manage_token_hash.
-PUBLIC_COLUMNS = "id,name,creator_name,description,status,created_at"
+PUBLIC_COLUMNS = "id,name,creator_name,description,status,created_at,chat_count,thumbs_up,thumbs_down"
 
 
 class DatabaseError(Exception):
-    """User-safe database failure."""
+    """User-safe database failure. `detail` is for organizer debugging only."""
+
+    detail = ""
 
 
 class DuplicateBotError(DatabaseError):
@@ -20,8 +22,11 @@ class DuplicateBotError(DatabaseError):
 def _wrap(exc: Exception) -> DatabaseError:
     if getattr(exc, "code", None) == "23505":
         return DuplicateBotError("That agent is already registered in the gallery.")
-    log.warning("Database error: %s", type(exc).__name__)  # class only; messages can leak data
-    return DatabaseError("Something went wrong saving your data. Try again.")
+    detail = f"{type(exc).__name__} code={getattr(exc, 'code', None)} message={str(getattr(exc, 'message', exc))[:300]}"
+    print("Database error:", detail, flush=True)  # stdout shows in Streamlit logs; no credentials in PostgREST errors
+    err = DatabaseError("Something went wrong saving your data. Try again.")
+    err.detail = detail
+    return err
 
 
 def _now() -> str:
@@ -47,7 +52,8 @@ class BotRepository:
     # --- public reads ---
     def list_public_bots(self) -> list[dict]:
         return self._run(
-            self._db.table("bots").select(PUBLIC_COLUMNS).neq("status", "disabled").order("created_at", desc=True)
+            self._db.table("bots").select(PUBLIC_COLUMNS).neq("status", "disabled")
+            .order("chat_count").order("created_at", desc=True)  # least popular first
         )
 
     def get_public_bot(self, bot_id: str) -> dict | None:
@@ -107,6 +113,13 @@ class BotRepository:
 
     def delete_all_bots(self) -> None:
         self._run(self._db.table("bots").delete().neq("id", "00000000-0000-0000-0000-000000000000"))
+
+    def bump(self, bot_id: str, chats: int = 0, up: int = 0, down: int = 0) -> None:
+        """Atomically adjust popularity counters. Counts only; no chat content is stored."""
+        try:
+            self._db.rpc("bump_bot", {"p_bot": bot_id, "p_chats": chats, "p_up": up, "p_down": down}).execute()
+        except Exception as exc:  # noqa: BLE001
+            raise _wrap(exc) from None
 
     # --- organizer ---
     def list_all_for_admin(self) -> list[dict]:

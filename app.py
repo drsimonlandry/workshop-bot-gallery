@@ -26,6 +26,17 @@ st.markdown(
 
 # --- shared resources ------------------------------------------------------
 
+REQUIRED_SECRETS = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ENCRYPTION_KEY", "ORGANIZER_ADMIN_SECRET")
+
+
+def check_config():
+    missing = [k for k in REQUIRED_SECRETS if k not in st.secrets]
+    if missing:
+        st.error("This app isn't configured yet. Missing secrets: " + ", ".join(missing)
+                 + ". Add them in the app's Settings > Secrets (see README).")
+        st.stop()
+
+
 @st.cache_resource
 def get_repo() -> BotRepository:
     return BotRepository.from_secrets(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SERVICE_ROLE_KEY"])
@@ -60,9 +71,25 @@ def guarded(fn, *args, **kwargs):
         return True, fn(*args, **kwargs)
     except (registration.ValidationError, security.SecurityError, fleet_client.FleetError, DatabaseError) as exc:
         st.error(str(exc))
-    except Exception:  # noqa: BLE001 - never leak internals
+        if st.secrets.get("DEBUG") and getattr(exc, "detail", ""):
+            st.code(exc.detail)  # organizer-only: set DEBUG = true in secrets
+    except Exception as exc:  # noqa: BLE001 - never leak internals
         st.error("Something went wrong. Try again.")
+        if st.secrets.get("DEBUG"):
+            st.code(type(exc).__name__)
     return False, None
+
+
+def best_effort(fn, *args, **kwargs):
+    """Popularity counters must never block navigation or chatting."""
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def new_conv() -> dict:
+    return {"id": uuid.uuid4().hex, "thread_id": None, "messages": [], "pending": None, "error": None}
 
 
 # --- gallery ---------------------------------------------------------------
@@ -85,7 +112,7 @@ def view_gallery():
             go("register")
         return
 
-    query = st.text_input("Search", placeholder="Search by name, creator, or description", label_visibility="collapsed").lower()
+    query = st.text_input("Search", placeholder="Search bots", label_visibility="collapsed").lower()
     shown = [b for b in bots if not query or any(query in b[k].lower() for k in ("name", "creator_name", "description"))]
     st.caption(f"{len(bots)} registered bot{'s' if len(bots) != 1 else ''}"
                + (f" · {len(shown)} match" if query else ""))
@@ -94,11 +121,17 @@ def view_gallery():
     for i, bot in enumerate(shown):
         with cols[i % 3].container(border=True):
             st.subheader(bot["name"])
-            st.caption(f"by {bot['creator_name']}")
-            st.write(bot["description"])
+            if bot["creator_name"]:
+                st.caption(f"by {bot['creator_name']}")
+            if bot["description"]:
+                st.write(bot["description"])
             available = bot["status"] == "active"
             st.markdown(":green[● Available]" if available else ":gray[● Unavailable]")
+            n = bot["chat_count"]
+            votes = f" · 👍 {bot['thumbs_up']} · 👎 {bot['thumbs_down']}" if bot["thumbs_up"] or bot["thumbs_down"] else ""
+            st.caption((f"{n} chat{'s' if n != 1 else ''}" if n else "No chats yet") + votes)
             if st.button("Chat", key=f"chat_{bot['id']}", disabled=not available, use_container_width=True, type="primary"):
+                best_effort(get_repo().bump, bot["id"], chats=1)
                 go("chat", bot_id=bot["id"])
 
 
@@ -137,8 +170,6 @@ def view_register():
         st.markdown(HELP)
 
     name = st.text_input("Bot name", max_chars=registration.MAX_NAME)
-    creator = st.text_input("Your name", max_chars=registration.MAX_NAME)
-    desc = st.text_area("Description", max_chars=registration.MAX_DESCRIPTION, help="What does your bot do?")
     agent_id = st.text_input("Agent ID")
     api_url = st.text_input("API URL", placeholder="https://your-agent.us.langgraph.app")
     pat = st.text_input("Personal Access Token", type="password")
@@ -157,7 +188,7 @@ def view_register():
         with st.spinner("Publishing…"):
             ok, result = guarded(
                 registration.register_bot, get_repo(), enc_key(),
-                name=name, creator_name=creator, description=desc,
+                name=name,
                 agent_id=agent_id, api_url=api_url, pat=pat, acknowledged=ack,
             )
         if ok:
@@ -191,21 +222,27 @@ def view_chat():
             go("gallery")
         return
 
-    conv = s.convs.setdefault(bot_id, {"thread_id": None, "messages": [], "pending": None, "error": None})
+    conv = s.convs.setdefault(bot_id, new_conv())
 
     top, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
     with top:
         st.title(bot["name"])
-        st.caption(f"by {bot['creator_name']} · {bot['description']}")
+        st.caption(" · ".join(x for x in (f"by {bot['creator_name']}" if bot["creator_name"] else "", bot["description"]) if x))
     if b1.button("← Gallery", use_container_width=True):
         go("gallery")
     if b2.button("New conversation", use_container_width=True):
-        s.convs[bot_id] = {"thread_id": None, "messages": [], "pending": None, "error": None}
+        s.convs[bot_id] = new_conv()
         st.rerun()
 
-    for m in conv["messages"]:
+    for i, m in enumerate(conv["messages"]):
         with st.chat_message(m["role"]):
             st.write(m["content"])
+            if m["role"] == "assistant":
+                vote = st.feedback("thumbs", key=f"fb_{conv['id']}_{i}")
+                if vote != m.get("vote"):
+                    up, down = registration.feedback_delta(m.get("vote"), vote)
+                    best_effort(get_repo().bump, bot_id, up=up, down=down)
+                    m["vote"] = vote
 
     text = st.chat_input("Type a message", max_chars=security.MAX_MESSAGE_CHARS)
     retry = False
@@ -236,6 +273,8 @@ def view_chat():
                 except (registration.ValidationError, security.SecurityError,
                         fleet_client.FleetError, DatabaseError) as exc:
                     conv["error"] = str(exc)
+                    if st.secrets.get("DEBUG") and getattr(exc, "detail", ""):
+                        conv["error"] += f"\n\n`{exc.detail}`"
                 except Exception:  # noqa: BLE001
                     conv["error"] = "Something went wrong. Try again."
                 else:
@@ -275,11 +314,10 @@ def view_manage():
     if not ok or not bot:
         return
 
-    st.subheader("Edit details")
+    st.subheader("Rename")
     name = st.text_input("Bot name", bot["name"], max_chars=registration.MAX_NAME)
-    desc = st.text_area("Description", bot["description"], max_chars=registration.MAX_DESCRIPTION)
     if st.button("Save changes"):
-        ok, _ = guarded(registration.update_details, repo, bot_id, token, name, desc)
+        ok, _ = guarded(registration.update_details, repo, bot_id, token, name, bot["description"])
         if ok:
             st.success("Saved")
 
@@ -345,6 +383,7 @@ def view_admin():
 # --- router ----------------------------------------------------------------
 
 def main():
+    check_config()
     s = ss()
     params = st.query_params
     if "manage" in params:  # private link: capture then strip from the URL
